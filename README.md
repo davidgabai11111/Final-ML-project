@@ -14,6 +14,10 @@ The objective is to predict asset performance using interpretable financial feat
 - Google Colab
 - scikit-learn, pandas, numpy
 
+## Code format
+The project is provided both as a Jupyter notebook (`.ipynb`) and as a Python script (`.py`).  
+The notebook can be opened and executed interactively using the **Open in Colab** button.
+
 ## Author
 David Gabai
 Axel Jarry
