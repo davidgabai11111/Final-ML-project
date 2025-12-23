@@ -148,22 +148,26 @@ def build_ml_dataset(rets: pd.DataFrame) -> pd.DataFrame:
 
     return data
 
+# Load historical prices, compute returns, and build the ML dataset
 px = load_prices_yf(list(cfg.tickers), cfg.start, cfg.end)
 rets = compute_returns(px)
 data_ml = build_ml_dataset(rets)
 
+# Inspect price dataset structure and check for missing values
 prices.info()
 prices.isna().sum()
 
+# Compute daily returns and display descriptive statistics
 returns = prices.pct_change().dropna()
 returns.describe().T
+
+# Check for duplicated rows in prices and ML dataset
 prices.duplicated().sum()
 data_ml.duplicated().sum()
 
-# ==========================
-#   Balance of classes
-# ==========================
+# Balance of classes
 
+# Visualize class distribution of the target variable
 plt.figure(figsize=(6,4))
 data_ml["y_cls"].value_counts().plot(kind="bar", color=["#4472C4", "#ED7D31"])
 plt.title("Class distribution (y_cls)", fontsize=14)
@@ -172,19 +176,16 @@ plt.ylabel("Number of observations")
 plt.grid(axis="y", alpha=0.3)
 plt.show()
 
+# Display class proportions
 print("Distribution (proportions) :")
 print(data_ml["y_cls"].value_counts(normalize=True))
 
-# ==========================================
-#   Data quality: missing values, duplicates, descriptive statistics
-# ==========================================
+# Data quality: missing values, duplicates, descriptive statistics
 
 print(" ML dataset dimensions :", data_ml.shape)
 print("\n Number of missing values :")
 print(data_ml.isna().sum())
-
 print("\n Number of duplicate rows :", data_ml.duplicated().sum())
-
 print("\n Descriptive statistics :")
 display(data_ml.describe())
 
@@ -192,15 +193,12 @@ display(data_ml.describe())
 print("\n Outlier analysis (1% et 99%) :")
 display(data_ml[["mom_1m", "vol_1m", "rev_1w"]].describe(percentiles=[0.01,0.05,0.95,0.99]).T)
 
+# Clean missing data: remove empty rows, forward-fill, then drop remaining NaNs
 prices = prices.dropna(how="all")
-
 prices = prices.ffill()
-
 prices = prices.dropna()
 
-# ======================
-#     PCA (2 components)
-# ======================
+# PCA (2 components)
 
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -226,7 +224,7 @@ plt.show()
 
 print("Variance explained by PC1 + PC2 :", pca.explained_variance_ratio_.sum())
 
-#   Statistical analysis of returns
+# Statistical analysis of returns
 returns = prices.pct_change().dropna()
 print(" Return statistics (annualized) :")
 
@@ -349,14 +347,16 @@ try:
 except ImportError:
     LGBMClassifier = None
 
-# ------------------ Utils: Metrics ------------------
-
+# Utils: Metrics
+# Metrics are computed on daily return series / equity curves to evaluate the strategies.
 def sharpe_ratio(daily_rets: pd.Series, freq: int = 252) -> float:
+    # Annualized Sharpe ratio assuming 'freq' trading days per year (default: 252)
     mu = daily_rets.mean()
     sd = daily_rets.std(ddof=1)
     return np.nan if sd == 0 or np.isnan(sd) else (mu / sd) * math.sqrt(freq)
 
 def cagr_from_equity(eq: pd.Series, trading_days: int = 252) -> float:
+    # CAGR computed from an equity curve (cumprod of 1+returns)
     eq = eq.dropna()
     if len(eq) < 2:
         return np.nan
@@ -364,11 +364,17 @@ def cagr_from_equity(eq: pd.Series, trading_days: int = 252) -> float:
     return (eq.iloc[-1] / eq.iloc[0])**(1 / years) - 1
 
 def max_drawdown(eq: pd.Series) -> float:
+    # Maximum drawdown: worst peak-to-trough decline of the equity curve
     peak = eq.cummax()
     dd = eq / peak - 1.0
     return dd.min()
 
-# ------------------ Main Backtest (for a given top_k) ------------------
+# Main Backtest (for a given top_k)
+
+# At each rebalancing date:
+# Train the ML model on STRICTLY past data (no look-ahead bias)
+# Predict scores for the current date
+# Buy the top_k assets and hold for H days (with transaction costs)
 
 def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: str):
     """
@@ -404,6 +410,7 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
     ret_topk = pd.Series(0.0, index=daily_idx, name="TOPK")
     ret_equal = pd.Series(0.0, index=daily_idx, name="EQUAL")
 
+    # Store which assets are selected at each rebalance (for interpretability)
     selection_history = []
 
     for d in rebal_dates:
@@ -419,10 +426,9 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
         y_tr = train["y_cls"].values
         X_te = test_today[["mom_1m", "vol_1m", "rev_1w"]].values
 
-        # -------------------------
         # ML model training
-        # -------------------------
         if model_type == "logreg":
+            # Linear baseline with scaling + class balance handling
             pipe = Pipeline([
                 ("scaler", StandardScaler()),
                 ("clf", LogisticRegression(
@@ -435,6 +441,7 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
             ppos = pipe.predict_proba(X_te)[:, 1]
 
         elif model_type == "svm":
+            # Non-linear classifier; probability=True enables predict_proba (slower but useful)
             pipe = Pipeline([
                 ("scaler", StandardScaler()),
                 ("clf", SVC(
@@ -449,6 +456,7 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
             ppos = pipe.predict_proba(X_te)[:, 1]
 
         elif model_type == "rf":
+            # Tree ensemble baseline (no scaling needed)
             mdl = RandomForestClassifier(
                 n_estimators=200,
                 max_depth=6,
@@ -467,6 +475,8 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
 
         # Selection of top_k assets
         top = preds.sort_values(ascending=False).head(top_k).index.tolist()
+
+        # Portfolio weights: equal weight among selected assets
         w_topk = pd.Series(0.0, index=tickers)
         if len(top) > 0:
             w_topk.loc[top] = 1.0 / len(top)
@@ -502,10 +512,10 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
         ret_topk.loc[idx] = (r * w_topk).sum(axis=1).values + ret_topk.loc[idx]
         ret_equal.loc[idx] = (r * w_equal).sum(axis=1).values + ret_equal.loc[idx]
 
-    # Final series
+    # Combine strategy and benchmark into one DataFrame
     df = pd.concat([ret_topk, ret_equal], axis=1).fillna(0.0)
 
-    # Metrics
+    # Compute performance metrics for each series
     metrics = []
     for name in ["TOPK", "EQUAL"]:
         rr = df[name]
@@ -525,6 +535,10 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
 
     return df, met, sel
 
+# Baseline ML models (hold-out evaluation)
+# Purpose: compare standard classifiers on the constructed dataset (F1 as main metric).
+# Note: we optionally subsample the dataset to speed up GridSearch in notebooks.
+
 def gridsearch_baseline_models(data: pd.DataFrame):
     """
     Extended version:
@@ -534,14 +548,17 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     - Also returns the name of the best model (based on F1)
     """
 
-    # --------- 0) Global subsampling ---------
+    # 0) Global subsampling
+    # We limit dataset size for fast iteration in notebooks
     MAX_SAMPLES = 5000
     if len(data) > MAX_SAMPLES:
         data = data.sample(n=MAX_SAMPLES, random_state=0)
 
+    # Feature matrix and binary label
     X = data[["mom_1m", "vol_1m", "rev_1w"]].values
     y = data["y_cls"].values
 
+    # Stratified split to preserve class proportions
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=0, stratify=y
     )
@@ -549,7 +566,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     best_models = {}
     rows = []
 
-    # --------- 1) Logistic Regression with small GridSearch ---------
+    # 1) Logistic Regression with small GridSearch
     logreg_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(
@@ -563,6 +580,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "clf__C": [0.1, 1.0, 10.0],
     }
 
+    # Cross-validation score uses F1 (more appropriate than accuracy under imbalance)
     print("\n=== GridSearch for Logistic Regression ===")
     gs = GridSearchCV(
         estimator=logreg_pipe,
@@ -577,6 +595,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     best_logreg = gs.best_estimator_
     best_models["logreg"] = best_logreg
 
+    # Evaluate on held-out test set
     y_pred_log = best_logreg.predict(X_test)
     acc_log = accuracy_score(y_test, y_pred_log)
     f1_log = f1_score(y_test, y_pred_log)
@@ -593,7 +612,8 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     print("Accuracy test        :", acc_log)
     print("F1 test              :", f1_log)
 
-    # --------- 2) Fixed SVM ---------
+    # 2) Fixed SVM
+    # (kept fixed to avoid heavy grid-search; scaling is mandatory for SVM)
     svm_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", SVC(C=2.0, kernel="rbf", gamma="scale", random_state=0))
@@ -611,7 +631,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "test_f1": f1_svm
     })
 
-    # --------- 3) Fixed Decision Tree  ---------
+    # 3) Fixed Decision Tree (interpretable, fast)
     tree_clf = DecisionTreeClassifier(
         criterion="gini",
         max_depth=5,
@@ -632,7 +652,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "test_f1": f1_tree
     })
 
-    # --------- 4) Random Forest ---------
+    # 4) Random Forest (robust non-linear model)
     rf_clf = RandomForestClassifier(
         n_estimators=200,
         max_depth=6,
@@ -654,7 +674,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "test_f1": f1_rf
     })
 
-    # --------- 5) XGBoost (if available) ---------
+    # 5) XGBoost (if available)
     if XGBClassifier is not None:
         xgb_clf = XGBClassifier(
             n_estimators=200,
@@ -682,7 +702,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     else:
         print("XGBoost not installed, XGB model ignored.")
 
-    # --------- 6) LightGBM (if available) ---------
+    # 6) LightGBM (if available)
     if LGBMClassifier is not None:
         lgbm_clf = LGBMClassifier(
             n_estimators=300,
@@ -738,7 +758,7 @@ def ensemble_models_on_project(best_models, data_splits):
         print("Need logreg and tree in best_models to build ensembles.")
         return
 
-    # --- Bagging Decision Tree (fast) ---
+    # Bagging Decision Tree (fast)
     bag_tree = BaggingClassifier(
         estimator=best_tree,
         n_estimators=15,   # small number of trees
@@ -747,7 +767,7 @@ def ensemble_models_on_project(best_models, data_splits):
         random_state=0
     )
 
-    # --- VotingClassifier (soft) : LogReg + Bagging Tree ---
+    # VotingClassifier (soft) : LogReg + Bagging Tree
     voting_clf = VotingClassifier(
         estimators=[
             ("logreg", best_logreg),
@@ -794,7 +814,7 @@ def ensemble_models_on_project(best_models, data_splits):
 
     return df_ens
 
-# ------------------ Main: grid search over k ------------------
+# Main: grid search over k
 
 def main():
     # 1) Data (done only once)
@@ -830,7 +850,7 @@ def main():
 
     # summary_ensembles = ensemble_models_on_project(best_models, data_splits)
 
-    # ========= REALISTIC BACKTEST (re-training at each date, only on the past) =========
+    # REALISTIC BACKTEST (re-training at each date, only on the past)
     results = []
     best_k = None
     best_score = -np.inf
@@ -900,6 +920,9 @@ best_models, summary_baselines, data_splits, best_model_name = gridsearch_baseli
 df_ens = ensemble_models_on_project(best_models, data_splits)
 df_ens
 
+# NOTE: This cell contains the SAME pipeline as the full-period version,
+# but restricted to a shorter time window (2021–2024) to run faster / compare stability.
+# The only change is the date filtering in main(); all functions/models/backtest logic remain identical.
 import io
 import math
 from dataclasses import dataclass
@@ -930,7 +953,7 @@ try:
 except ImportError:
     LGBMClassifier = None
 
-# ------------------ Utils: Metrics ------------------
+# Utils: Metrics
 
 def sharpe_ratio(daily_rets: pd.Series, freq: int = 252) -> float:
     mu = daily_rets.mean()
@@ -949,7 +972,7 @@ def max_drawdown(eq: pd.Series) -> float:
     dd = eq / peak - 1.0
     return dd.min()
 
-# ------------------ Main Backtest (for a given top_k) ------------------
+# Main Backtest (for a given top_k)
 
 def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: str):
     """
@@ -1000,9 +1023,7 @@ def run_backtest(px: pd.DataFrame, rets: pd.DataFrame, top_k: int, model_type: s
         y_tr = train["y_cls"].values
         X_te = test_today[["mom_1m", "vol_1m", "rev_1w"]].values
 
-        # -------------------------
         # ML model training
-        # -------------------------
         if model_type == "logreg":
             pipe = Pipeline([
                 ("scaler", StandardScaler()),
@@ -1115,7 +1136,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     - Also returns the name of the best model (based on F1)
     """
 
-    # --------- 0) Global subsampling  ---------
+    # 0) Global subsampling
     MAX_SAMPLES = 5000
     if len(data) > MAX_SAMPLES:
         data = data.sample(n=MAX_SAMPLES, random_state=0)
@@ -1130,7 +1151,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     best_models = {}
     rows = []
 
-    # --------- 1) Logistic Regression with small GridSearch ---------
+    # 1) Logistic Regression with small GridSearch
     logreg_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(
@@ -1174,7 +1195,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     print("Accuracy test        :", acc_log)
     print("F1 test              :", f1_log)
 
-    # --------- 2) Fixed SVM ---------
+    # 2) Fixed SVM
     svm_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", SVC(C=2.0, kernel="rbf", gamma="scale", random_state=0))
@@ -1192,7 +1213,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "test_f1": f1_svm
     })
 
-    # --------- 3) Fixed Decision Tree  ---------
+    # 3) Fixed Decision Tree
     tree_clf = DecisionTreeClassifier(
         criterion="gini",
         max_depth=5,
@@ -1213,7 +1234,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "test_f1": f1_tree
     })
 
-    # --------- 4) Random Forest ---------
+    # 4) Random Forest
     rf_clf = RandomForestClassifier(
         n_estimators=200,
         max_depth=6,
@@ -1235,7 +1256,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
         "test_f1": f1_rf
     })
 
-    # --------- 5) XGBoost (if available) ---------
+    # 5) XGBoost (if available)
     if XGBClassifier is not None:
         xgb_clf = XGBClassifier(
             n_estimators=200,
@@ -1263,7 +1284,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     else:
         print(" XGBoost not installed, XGB model ignored.")
 
-    # --------- 6) LightGBM (if available) ---------
+    # 6) LightGBM (if available)
     if LGBMClassifier is not None:
         lgbm_clf = LGBMClassifier(
             n_estimators=300,
@@ -1290,7 +1311,7 @@ def gridsearch_baseline_models(data: pd.DataFrame):
     else:
         print("LightGBM not installed, LGBM model ignored.")
 
-    # --------- 7) Summary + best model choice  ---------
+    # 7) Summary + best model choice
     summary = pd.DataFrame(rows).set_index("model")
     #print("\n=== Extended baselines summary  ===")
     #print(summary)
@@ -1319,7 +1340,7 @@ def ensemble_models_on_project(best_models, data_splits):
         print("Need logreg and tree in best_models to build ensembles.")
         return
 
-    # --- Bagging Decision Tree (fast) ---
+    # Bagging Decision Tree (fast)
     bag_tree = BaggingClassifier(
         estimator=best_tree,
         n_estimators=15,   # small numbers of trees
@@ -1328,7 +1349,7 @@ def ensemble_models_on_project(best_models, data_splits):
         random_state=0
     )
 
-    # --- VotingClassifier (soft) : LogReg + Bagging Tree ---
+    # VotingClassifier (soft) : LogReg + Bagging Tree
     voting_clf = VotingClassifier(
         estimators=[
             ("logreg", best_logreg),
@@ -1375,7 +1396,7 @@ def ensemble_models_on_project(best_models, data_splits):
 
     return df_ens
 
-# ------------------ Main: grid search over k ------------------
+# Main: grid search over k
 
 def main():
     # 1) Data (done only once)
@@ -1414,7 +1435,7 @@ def main():
 
     # summary_ensembles = ensemble_models_on_project(best_models, data_splits)
 
-    # ========= REALISTIC BACKTEST (re-training at each date, only on the past) =========
+    # REALISTIC BACKTEST (re-training at each date, only on the past)
     results = []
     best_k = None
     best_score = -np.inf
